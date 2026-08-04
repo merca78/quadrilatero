@@ -92,7 +92,7 @@ module quadrilatero_mac_float (
                         fpnew_pkg::MERGED,
                         fpnew_pkg::DISABLED,
                         fpnew_pkg::DISABLED}},  // DOTP
-        PipeConfig: fpnew_pkg::BEFORE
+        PipeConfig: fpnew_pkg::DISTRIBUTED
     }
   };
   

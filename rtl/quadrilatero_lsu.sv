@@ -101,16 +101,46 @@ module quadrilatero_lsu #(
   logic [     DATA_WIDTH-1:0] store_fifo_output ;
   logic                       store_fifo_pop    ;
 
+  // Used to track the type of requests that were made but for which no response was received (0: Read, 1: Write)
+  logic [4:0]  outstanding_cnt_q, outstanding_cnt_d; 
+  logic [15:0] outstanding_we_q, outstanding_we_d; 
+  logic        current_rsp_is_write;
 
   enum {
     LSU_READY,
-    LSU_RUNNING
-  }
-      lsu_state_q, lsu_state_d;
+    LSU_RUNNING,
+    LSU_WAIT_RESP
+  } lsu_state_q, lsu_state_d;
 
+always_comb begin : outstanding_tracker_block
+    outstanding_cnt_d = outstanding_cnt_q;
+    outstanding_we_d  = outstanding_we_q;
+
+    // Pop a record when any response is received (rvalid)
+    if (data_rvalid_i && outstanding_cnt_q > 0) begin
+      outstanding_we_d  = outstanding_we_q >> 1;
+      outstanding_cnt_d = outstanding_cnt_q - 1;
+    end
+
+    // When issuing a request and handshaking (gnt), push whether the current request is a read or a write (we)
+    if (data_req_o && data_gnt_i) begin
+      //* Handle both push and pop in the same cycle
+      if (data_rvalid_i && outstanding_cnt_q > 0) begin
+        outstanding_we_d[outstanding_cnt_q - 1] = data_we_o;
+        outstanding_cnt_d = outstanding_cnt_q; 
+      end else begin
+        outstanding_we_d[outstanding_cnt_q] = data_we_o;
+        outstanding_cnt_d = outstanding_cnt_q + 1;
+      end
+    end
+
+    // Is the response currently being processed the result of a previously issued write operation
+    current_rsp_is_write = (outstanding_cnt_q > 0) ? outstanding_we_q[0] : 1'b0;
+  end
 
   always_comb begin : FSM_block
     lsu_state_d  = lsu_state_q;
+    terminate    = 1'b0;
 
     case (lsu_state_q)
       LSU_READY: begin
@@ -119,17 +149,35 @@ module quadrilatero_lsu #(
         end
       end
       LSU_RUNNING: begin
-        if (terminate && !start_i) begin
-          lsu_state_d = LSU_READY;
+        // When the last request is successfully handshaked and sent to the bus
+        if (|rows_q == '0 && |cols_q == '0 && data_gnt_i && data_req_o) begin
+          if (outstanding_cnt_d == 0) begin
+            terminate = 1'b1;
+            if (!start_i) lsu_state_d = LSU_READY;
+          end else begin 
+            lsu_state_d = LSU_WAIT_RESP;
+          end
+        end
+      
+        // if (terminate && !start_i) begin
+        //   lsu_state_d = LSU_READY;
+        // end
+      end
+      LSU_WAIT_RESP: begin
+        // When the tracker is cleared, it means that AXI's BVALID and RVALID have all been secured!
+        if (outstanding_cnt_d == 0) begin
+          terminate = 1'b1;
+          if (!start_i) lsu_state_d = LSU_READY;
+          else          lsu_state_d = LSU_RUNNING;
         end
       end
     endcase
   end
   
   always_comb begin : ctrl_block
-    terminate         = (|rows_q == '0 && |cols_q == '0 && data_gnt_i && data_req_o && (lsu_state_q == LSU_RUNNING)); 
+    // terminate         = (|rows_q == '0 && |cols_q == '0 && data_gnt_i && data_req_o && (lsu_state_q == LSU_RUNNING)); 
     load_fifo_valid_o = rd_valid_d;
-    busy_o            = (lsu_state_q == LSU_RUNNING) & ~terminate;
+    busy_o            = (lsu_state_q != LSU_READY) & ~terminate;
     terminate_o       = terminate;
   end
 
@@ -201,13 +249,13 @@ module quadrilatero_lsu #(
     data_wdata_o       = data_out_wdata;
     data_out_gnt       = data_gnt_i    ;
     data_in_rdata      = data_rdata_i  ;
+    data_in_rvalid     = data_rvalid_i ;
 
     if(store_fifo_empty) begin  // read transaction active
         data_req_o     = data_in_req   ;
         data_we_o      = data_in_we    ;
         data_be_o      = data_in_be    ;
         data_addr_o    = data_in_addr  ;
-        data_in_rvalid = data_rvalid_i ;
     end else begin  // write transaction active
         data_req_o     = data_out_req  ;
         data_we_o      = data_out_we   ;
@@ -218,7 +266,8 @@ module quadrilatero_lsu #(
 
   always_comb begin : load_fifo_block
     data_we_d          = data_gnt_i && data_req_o && data_we_o;
-    rvalid             = data_in_rvalid &~ data_we_q          ;
+    // rvalid             = data_in_rvalid &~ data_we_q          ;
+    rvalid             = data_in_rvalid &~ current_rsp_is_write  ;
 
     load_fifo_alm_full = (load_fifo_usage == LastFifoUsage[Addr_Fifo_Depth-1:0]);
     load_fifo_input    = data_in_rdata;
@@ -296,6 +345,8 @@ module quadrilatero_lsu #(
       rd_head_q         <= '0       ;
       rd_valid_q        <= '0       ;
       data_we_q         <= '0       ;
+      outstanding_cnt_q <= '0       ;
+      outstanding_we_q  <= '0       ;
     end else begin
       lsu_state_q       <= lsu_state_d;
       ptr_q             <= ptr_d      ;
@@ -304,6 +355,8 @@ module quadrilatero_lsu #(
       rd_head_q         <= rd_head_d  ;
       rd_valid_q        <= rd_valid_d ;
       data_we_q         <= data_we_d  ;
+      outstanding_cnt_q <= outstanding_cnt_d  ;
+      outstanding_we_q  <= outstanding_we_d   ;
     end
   end
 

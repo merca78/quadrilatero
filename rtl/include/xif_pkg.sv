@@ -10,7 +10,7 @@ package xif_pkg;
   // ------------------------------
 
   parameter int X_NUM_RS = 2;
-  parameter int X_ID_WIDTH = 4;
+  parameter int X_ID_WIDTH = 5;
   parameter int X_MEM_WIDTH = 32;
   parameter int X_RFR_WIDTH = 32;
   parameter int X_RFW_WIDTH = 32;
