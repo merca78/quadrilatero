@@ -142,6 +142,10 @@ module quadrilatero_register_lsu #(
   end
 
   always_comb begin: lsu_ctrl_block
+ // KNOWN LATENT BUG: Unmasked FIFO Pop
+// Mechanism: The RF write (`we_o`) is masked by `mask_req`, but this FIFO pop 
+// is NOT. If `mask_req` and `wready_i` assert simultaneously while data is at 
+// the head, the word is popped and silently dropped without reaching the RF.
     load_fifo_pop   = wready_i;
     store_fifo_data = rdata_i;
     store_fifo_push = rdata_ready_o && rdata_valid_i;
@@ -280,4 +284,24 @@ module quadrilatero_register_lsu #(
         "[quadrilatero_register_lsu] N_ROWS must be at least 2.\n"
     );
   end
+
+  // --------------------------------------------------------------------------
+  // Detectors for the latent row drop
+  `ifdef XSIM
+  // 1. The drop itself: head popped while the RF write is masked.
+  assert property (@(posedge clk_i) disable iff (~rst_ni)
+      !(load_fifo_pop && load_fifo_data_available && !we_o)) else
+    $error("[quadrilatero_register_lsu] load row dropped: popped the load FIFO with we_o=0 (mask_req=%0b counter_q=%0d waddr_q=%0d)",
+           mask_req, counter_q, waddr_q);
+
+  // 2. The masking window.  
+  cover property (@(posedge clk_i) disable iff (~rst_ni) $rose(mask_req))
+    $display("[quadrilatero_register_lsu] %0t: mask_req stall window entered (pending completion id=%0d)",
+             $time, finished_instr_id_o);
+
+  // 3. How long the window lasts. 
+  assert property (@(posedge clk_i) disable iff (~rst_ni)
+      $rose(mask_req) |-> ##[1:64] !mask_req) else
+    $error("[quadrilatero_register_lsu] mask_req held >64 cycles -- LSU completion starved at the fixed-priority arbiter");
+  `endif
 endmodule

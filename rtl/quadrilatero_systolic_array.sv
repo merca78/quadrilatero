@@ -94,6 +94,8 @@ module quadrilatero_systolic_array #(
   logic                           fs_enable          ;
   logic                           dr_enable          ;
   logic                           pump               ;
+  logic                           stall              ;
+  logic                           dep_hazard         ;
   logic [$clog2(MESH_WIDTH)-1 :0] ff_counter_d       ;
   logic [$clog2(MESH_WIDTH)-1 :0] ff_counter_q       ;
   logic [$clog2(MESH_WIDTH)-1 :0] fs_counter_d       ;
@@ -110,17 +112,28 @@ module quadrilatero_systolic_array #(
   quadrilatero_pkg::sa_ctrl_t       sa_ctrl_d          ;
   quadrilatero_pkg::sa_ctrl_t       sa_ctrl_q          ;
 
-  logic [     $clog2(N_REGS)-1:0] acc_fs_q           ;  // Accumulator register -- FS Stage
-  logic [     $clog2(N_REGS)-1:0] acc_fs_d           ;  // Accumulator register -- FS Stage
   logic [     $clog2(N_REGS)-1:0] dest_reg_q         ;  // Accumulator register -- DR Stage
   logic [     $clog2(N_REGS)-1:0] dest_reg_d         ;  // Accumulator register -- DR Stage
 
   logic [xif_pkg::X_ID_WIDTH-1:0] id_ff_d            ;
   logic [xif_pkg::X_ID_WIDTH-1:0] id_ff_q            ;
-  logic [xif_pkg::X_ID_WIDTH-1:0] id_fs_d            ;
-  logic [xif_pkg::X_ID_WIDTH-1:0] id_fs_q            ;
   logic [xif_pkg::X_ID_WIDTH-1:0] id_dr_d            ;
   logic [xif_pkg::X_ID_WIDTH-1:0] id_dr_q            ;
+
+// FF -> DR identity handoff. 
+// Stall-safe update to prevent the drain phase from retiring under a stale 
+// (previous) instruction ID when FF stalls on the RF scoreboard.
+  typedef struct packed {
+    logic [xif_pkg::X_ID_WIDTH-1:0] id     ;
+    logic [     $clog2(N_REGS)-1:0] acc_reg;
+  } sa_ident_t;
+
+  sa_ident_t id_fifo_in    ;
+  sa_ident_t id_fifo_out   ;
+  logic      id_fifo_push  ;
+  logic      id_fifo_pop   ;
+  logic      id_fifo_empty ;
+  logic      id_fifo_full  ;
 
   logic                           finished_d         ;
   logic                           finished_q         ;
@@ -171,12 +184,10 @@ module quadrilatero_systolic_array #(
     weight_reg_d  = (set_ff_active) ? weight_reg_i  : weight_reg_q ;
     sa_ctrl_d     = (set_ff_active) ? sa_ctrl_i     : sa_ctrl_q    ;
 
-    acc_fs_d      = (set_fs_active) ? acc_reg_q     : acc_fs_q     ;
-    dest_reg_d    = (set_dr_active) ? acc_fs_q      : dest_reg_q   ;
+    dest_reg_d    = (set_dr_active) ? id_fifo_out.acc_reg : dest_reg_q;
 
     id_ff_d       = (set_ff_active) ? id_i          : id_ff_q      ;
-    id_fs_d       = (set_fs_active) ? id_ff_q       : id_fs_q      ;
-    id_dr_d       = (set_dr_active) ? id_fs_q       : id_dr_q      ;
+    id_dr_d       = (set_dr_active) ? id_fifo_out.id : id_dr_q     ;
 
     // Finished
     finished_d          = (res_wready_i && res_wlast_o) ? 1'b1 :
@@ -212,11 +223,20 @@ module quadrilatero_systolic_array #(
     valid = weight_rdata_valid_i & data_rdata_valid_i & acc_rdata_valid_i;
     clear = ~ff_active_q & ~fs_active_q & ~dr_active_q;
 
+    // Global Pump Synchronization
+    //
+    // The mesh, skewers, and weight double-buffer share a SINGLE pump. An FF lap 
+    // strictly requires MESH_WIDTH consecutive pumps to maintain spatial alignment 
+    // between propagating data and weight fetches.
+    //
+    // 1. Array Freeze Rule: If FF stalls waiting for an operand, the ENTIRE array 
+    //    must freeze. FS and DR phases are forbidden from pumping independently.
+    // 2. Deadlock Safety: Freezing DR is safe. Internal RAW hazards are handled 
+    //    by `dep_hazard`, so FF only stalls on external LSU/perm-unit writes.
+    stall     = ff_active_q & ~valid                ;
     ff_enable = ff_active_q &  valid                ;
-    // fs_enable = fs_active_q & (valid | ~ff_active_q);
-    // dr_enable = dr_active_q & (valid | ~ff_active_q);
-    fs_enable = fs_active_q;
-    dr_enable = dr_active_q;
+    fs_enable = fs_active_q & ~stall                ;
+    dr_enable = dr_active_q & ~stall                ;
 
     set_ff_active = ff_counter_d=='0 & start_i                                                                                          ;
     set_fs_active = fs_counter_d=='0 & ff_counter_d=='0                                & ff_counter_q==$clog2(MESH_WIDTH)'(MESH_WIDTH-1);
@@ -228,7 +248,39 @@ module quadrilatero_systolic_array #(
 
     pump     = ff_enable | fs_enable | dr_enable                              ;
     mask_req = (dr_counter_q==$clog2(MESH_WIDTH)'(MESH_WIDTH-1)) & finished_q & ~finished_ack_i;
+
+    // one push per instruction leaving FF, one pop per drain lap starting
+    id_fifo_push        = ff_enable & (ff_counter_q==$clog2(MESH_WIDTH)'(MESH_WIDTH-1));
+    id_fifo_pop         = set_dr_active                                                ;
+    id_fifo_in.id       = id_ff_q                                                      ;
+    id_fifo_in.acc_reg  = acc_reg_q                                                    ;
+
+    // Start-time RAW guard: a new instruction whose source register is the destination of an
+    // instruction still inside the array (FF, FS or DR) would stall in FF waiting for the DR
+    // write-back, and with the shared pump frozen that write-back could never happen.  Such an
+    // instruction waits in the issue queue until the array is empty (exactly what N<=2 does today).
+    dep_hazard = (ff_active_q    & (data_reg_i==acc_reg_q           | weight_reg_i==acc_reg_q           | acc_reg_i==acc_reg_q          ))
+               | (~id_fifo_empty & (data_reg_i==id_fifo_out.acc_reg | weight_reg_i==id_fifo_out.acc_reg | acc_reg_i==id_fifo_out.acc_reg))
+               | (dr_active_q    & (data_reg_i==dest_reg_q          | weight_reg_i==dest_reg_q          | acc_reg_i==dest_reg_q         ));
   end
+
+  fifo_v3 #(
+      .FALL_THROUGH(0         ),
+      .DEPTH       (2         ),
+      .dtype       (sa_ident_t)
+  ) id_fifo_i (
+      .clk_i                   ,
+      .rst_ni                  ,
+      .flush_i   (1'b0        ),
+      .testmode_i(1'b0        ),
+      .usage_o   (/* unused */),
+      .full_o    (id_fifo_full ),
+      .empty_o   (id_fifo_empty),
+      .data_i    (id_fifo_in  ),
+      .push_i    (id_fifo_push),
+      .data_o    (id_fifo_out ),
+      .pop_i     (id_fifo_pop )
+  );
 
   quadrilatero_skewer #(
       .MESH_WIDTH(MESH_WIDTH),
@@ -320,10 +372,8 @@ module quadrilatero_systolic_array #(
       acc_reg_q           <= '0;
       weight_reg_q        <= '0;
       sa_ctrl_q           <= '0;
-      acc_fs_q            <= '0;
       dest_reg_q          <= '0;
       id_ff_q             <= '0;
-      id_fs_q             <= '0;
       id_dr_q             <= '0;
       finished_q          <= '0;
       finished_instr_id_q <= '0;
@@ -338,25 +388,40 @@ module quadrilatero_systolic_array #(
       acc_reg_q           <= acc_reg_d           ;
       weight_reg_q        <= weight_reg_d        ;
       sa_ctrl_q           <= sa_ctrl_d           ;
-      acc_fs_q            <= acc_fs_d            ;
       dest_reg_q          <= dest_reg_d          ;
       id_ff_q             <= id_ff_d             ;
-      id_fs_q             <= id_fs_d             ;
       id_dr_q             <= id_dr_d             ;
       finished_q          <= finished_d          ;
       finished_instr_id_q <= finished_instr_id_d ;
     end
   end
  
-  assign sa_ready_o          = (ff_counter_d=='0) & ((ff_active_q &~ ff_counter_q=='0) | (~ff_active_q & ~fs_active_q & ~dr_active_q));
+  assign sa_ready_o          = (ff_counter_d=='0) & ((ff_active_q &~ ff_counter_q=='0) | (~ff_active_q & ~fs_active_q & ~dr_active_q)) & ~dep_hazard;
   assign sa_input_id_o       = id_ff_q            ;
   assign sa_output_id_o      = id_dr_q            ;
   assign finished_o          = finished_q         ;
   assign finished_instr_id_o = finished_instr_id_q;
 
   // --------------------------------------------------------------------
-  
+
   // Assertions
+`ifdef XSIM
+  assert property (@(posedge clk_i) disable iff (!rst_ni) id_fifo_pop |-> !id_fifo_empty)
+  else $error("[systolic_array] drain lap started with no identity queued");
+  assert property (@(posedge clk_i) disable iff (!rst_ni) id_fifo_push |-> !id_fifo_full)
+  else $error("[systolic_array] identity queue overflow");
+  // The invariant the shared pump relies on: with FS/DR frozen alongside FF, an FF lap always
+  // ends on an FS lap boundary, so the identity handoff can never be skipped and at most one
+  // instruction is ever queued between FF and DR.
+  assert property (@(posedge clk_i) disable iff (!rst_ni) id_fifo_push |-> set_fs_active)
+  else $error("[systolic_array] FF finished off the FS lap boundary (pump/FF misaligned)");
+  assert property (@(posedge clk_i) disable iff (!rst_ni) id_fifo_push |-> id_fifo_empty)
+  else $error("[systolic_array] identity queue held an entry when a second one was pushed");
+  // FS/DR may only advance while FF is not waiting for an operand.
+  assert property (@(posedge clk_i) disable iff (!rst_ni) stall |-> !pump)
+  else $error("[systolic_array] pump ran while FF was stalled");
+`endif
+
   if (MESH_WIDTH < 2) begin
     $error(
         "[systolic_array] MESH_WIDTH must be at least 2.\n"

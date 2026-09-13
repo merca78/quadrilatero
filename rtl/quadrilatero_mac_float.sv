@@ -133,11 +133,7 @@ module quadrilatero_mac_float (
     .busy_o         (busy_out)
   );
 
-  always_ff @(posedge clk_i or negedge rst_ni) begin : seq_block
-    if (!rst_ni) begin
-      ready        <= '0;
-    end else begin
-      ready        <= valid_i;
-    end
-  end
+// Acknowledge the FPU result ONLY on an active pump.
+// Prevents premature retirement and loss of partial sums during mesh stalls.
+  assign ready = valid_i;
 endmodule

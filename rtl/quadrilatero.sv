@@ -561,6 +561,16 @@ module quadrilatero
     rf_seq_wr_id_from_fu   [quadrilatero_pkg::RF_W          ]   = perm_unit_id      ;
   end
 
+// RF-Sequencer Scoreboard Depth (Per-Register)
+// Override via build script: `-sa_rf_entries N` -> `QUAD_RF_N_ENTRIES=N`
+// - Default: 2 (Legacy design)
+// - Constraint: MUST be >= 4 if the bridge in-flight capacity is >= 3.
+`ifdef QUAD_RF_N_ENTRIES
+  localparam int unsigned RfSeqNEntries = `QUAD_RF_N_ENTRIES;
+`else
+  localparam int unsigned RfSeqNEntries = 2;
+`endif
+
   quadrilatero_rf_sequencer #(
       .READ_PORTS       (quadrilatero_pkg::READ_PORTS     ),
       .WRITE_PORTS      (quadrilatero_pkg::WRITE_PORTS    ),
@@ -569,7 +579,7 @@ module quadrilatero
       .RLEN             (quadrilatero_pkg::RLEN           ),
       .RF_READ_PORTS    (quadrilatero_pkg::RF_READ_PORTS  ),
       .RF_WRITE_PORTS   (quadrilatero_pkg::RF_WRITE_PORTS ),
-      .N_ENTRIES        (2       )
+      .N_ENTRIES        (RfSeqNEntries   )
   ) rf_seq_inst (
 
       .clk_i                                      ,
